@@ -28,10 +28,13 @@ struct Config {
   uint8_t wb[3] = {255, 255, 255}; // white balance per channel (R, G, B)
   bool dark = true;                // also dither below one level (smoother fades, may sparkle when very dim)
   uint8_t fps = 255;               // realtime mode: re-sends per second (255 = auto: as fast as the LEDs allow, 0 = only new frames)
+  uint8_t minHz = 0;               // flicker limit: no dither pattern slower than this (0 = off). With R refreshes/s,
+                                   // fractions are limited to steps of 1/N, N = R / minHz (N = 1: plain rounding)
 };
 
 extern Config cfg;
 extern uint32_t frames;            // dithered frames shown (for /json/info)
+extern uint16_t levels;            // steps per level allowed by the flicker limit (256 = no limit); set by the usermod
 
 void setGamma(float g);            // rebuild the 16-bit gamma table
 bool beginFrame(size_t len, uint8_t stripBri);   // true when this frame is dithered

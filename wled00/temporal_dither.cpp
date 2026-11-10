@@ -5,6 +5,7 @@ namespace TDither {
 
 Config cfg;
 uint32_t frames = 0;
+uint16_t levels = 256;
 
 static uint16_t lut[256];          // 8-bit input -> 16-bit linear output (gamma applied)
 static float lutGamma = -1.0f;
@@ -43,6 +44,11 @@ uint32_t apply(size_t i, uint32_t c) {
   for (int k = 0; k < 3; k++) {
     uint32_t v = ((uint32_t)lut[in[k]] * scale[k]) >> 16;   // 8.8 fixed point output level
     uint32_t level = v >> 8, frac = v & 0xFF;
+    if (levels < 256) {                          // flicker limit: only k/levels of a step, so patterns repeat fast
+      uint32_t k = (frac * levels + 128) >> 8;
+      if (k >= levels) { if (level < 255) level++; frac = 0; }
+      else frac = (k << 8) / levels;
+    }
     if (level == 0 && !cfg.dark) { out[k] = frac >= 128 ? 1 : 0; continue; }
     uint32_t a = e[k] + frac;
     if (a >= 256 && level < 255) level++;

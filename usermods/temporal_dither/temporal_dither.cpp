@@ -11,13 +11,30 @@
 #include "temporal_dither.h"
 
 #define USERMOD_ID_TEMPORAL_DITHER 200
-#define TDITHER_FW "dither2"
+#define TDITHER_FW "dither3"
 #define TDITHER_AUTO 255          // fps value meaning "as fast as the LEDs allow"
 
 class TemporalDitherUsermod : public Usermod {
   unsigned long lastRefresh = 0, rateAt = 0;
-  unsigned long sentAtUs = 0;     // when our last refresh started (0 = not timing one)
-  float ledUs = 0;                // measured time for one LED refresh (average)
+  float txUs = 0;                 // time to send one refresh to the LEDs, from the wiring (longest output)
+  float cpuUs = 0;                // time WLED needs to prepare one refresh (measured)
+  unsigned long txAt = 0;
+  int sMinHz = 0;
+
+  // One refresh takes as long as the longest output: outputs send at the same time.
+  // WS2812-style LEDs: 24 bits (32 with white) at 800 kHz = 1.25 us per bit; plus ~300 us reset.
+  void computeTx() {
+    float worst = 0;
+    for (size_t i = 0; i < BusManager::getNumBusses(); i++) {
+      Bus *b = BusManager::getBus(i);
+      if (!b || !b->isDigital()) continue;
+      float us = b->is2Pin() ? b->getLength() * 32000.0f / max(100, (int)b->getFrequency())
+                             : b->getLength() * (b->hasWhite() ? 40.0f : 30.0f) + 300.0f;
+      worst = max(worst, us);
+    }
+    txUs = worst;
+  }
+  float ledUs() const { return max(txUs, cpuUs); }
   uint32_t rateFrames = 0;
   float rate = 0;
   // saved settings (boot defaults)
@@ -34,6 +51,7 @@ class TemporalDitherUsermod : public Usermod {
     for (int i = 0; i < 3; i++) TDither::cfg.wb[i] = constrain(sWb[i], 0, 255);
     TDither::cfg.fps = sFps == TDITHER_AUTO ? TDITHER_AUTO : constrain(sFps, 0, 250);
     TDither::cfg.bri16 = 0;
+    TDither::cfg.minHz = constrain(sMinHz, 0, 120);
   }
 
   void fill(JsonObject o) {
@@ -44,6 +62,7 @@ class TemporalDitherUsermod : public Usermod {
     JsonArray wb = o.createNestedArray("wb");
     for (int i = 0; i < 3; i++) wb.add(c.wb[i]);
     o["dark"] = c.dark;
+    o["minHz"] = c.minHz;
     if (c.fps == TDITHER_AUTO) o["fps"] = "auto"; else o["fps"] = c.fps;
   }
 
@@ -56,24 +75,23 @@ class TemporalDitherUsermod : public Usermod {
       rate = (TDither::frames - rateFrames) * 1000.0f / (now - rateAt);
       rateFrames = TDither::frames;
       rateAt = now;
+      // flicker limit: with `rate` refreshes/s, a pattern of N refreshes repeats rate/N times a second
+      const TDither::Config &cc = TDither::cfg;
+      TDither::levels = (cc.minHz && rate > 0) ? (uint16_t)constrain((int)(rate / cc.minHz), 1, 256) : 256;
     }
+    if (now - txAt >= 5000 || txUs == 0) { txAt = now; computeTx(); }
     // realtime mode only shows new frames when they arrive: keep refreshing the last one so the dither runs
     const TDither::Config &c = TDither::cfg;
-    bool busy = strip.isUpdating();
-    if (sentAtUs && !busy) {            // our refresh has gone out to the LEDs: how long did it take?
-      float us = micros() - sentAtUs;
-      ledUs = ledUs > 0 ? ledUs * 0.9f + us * 0.1f : us;
-      sentAtUs = 0;
-    }
-    if (!c.on || !c.fps || realtimeMode == REALTIME_MODE_INACTIVE || realtimeOverride || busy) return;
+    if (!c.on || !c.fps || realtimeMode == REALTIME_MODE_INACTIVE || realtimeOverride || strip.isUpdating()) return;
     unsigned long periodUs;
-    if (c.fps == TDITHER_AUTO) periodUs = ledUs > 0 ? max(4000UL, (unsigned long)(ledUs * 1.1f) + 500UL) : 0;  // ~90% of the LEDs' maximum
+    if (c.fps == TDITHER_AUTO) periodUs = max(4000UL, (unsigned long)(ledUs() * 1.1f) + 300UL);  // ~90% of the LEDs' maximum
     else periodUs = 1000000UL / c.fps;
     unsigned long nowUs = micros();
     if (nowUs - lastRefresh < periodUs) return;
     lastRefresh = nowUs;
-    sentAtUs = nowUs;
     strip.show();
+    float us = micros() - nowUs;                 // preparing the frame (sending continues in the background)
+    cpuUs = cpuUs > 0 ? cpuUs * 0.9f + us * 0.1f : us;
   }
 
   void addToJsonInfo(JsonObject &root) override {
@@ -81,8 +99,11 @@ class TemporalDitherUsermod : public Usermod {
     d["fw"] = TDITHER_FW;
     fill(d);
     d["rate"] = roundf(rate * 10) / 10;
-    d["ledMs"] = roundf(ledUs / 100.0f) / 10;                         // one LED refresh, measured
-    d["ledMax"] = ledUs > 0 ? (int)(1000000.0f / ledUs) : 0;          // refreshes/s the LEDs can do
+    d["ledMs"] = roundf(ledUs() / 100.0f) / 10;                       // one refresh: sending (longest output) or preparing
+    d["ledMax"] = ledUs() > 0 ? (int)(1000000.0f / ledUs()) : 0;      // refreshes/s the LEDs can do
+    d["sendMs"] = roundf(txUs / 100.0f) / 10;
+    d["prepMs"] = roundf(cpuUs / 100.0f) / 10;
+    d["levels"] = TDither::levels;                                    // steps per level the flicker limit allows
     JsonObject user = root["u"];
     if (user.isNull()) user = root.createNestedObject("u");
     JsonArray a = user.createNestedArray(F("Temporal dither"));
@@ -100,6 +121,7 @@ class TemporalDitherUsermod : public Usermod {
     if (d["bri16"].is<int>()) c.bri16 = constrain(d["bri16"].as<int>(), 0, 65535);
     if (d["g"].is<float>()) c.gamma = constrain(d["g"].as<float>(), 1.0f, 3.5f);
     if (d["dark"].is<bool>()) c.dark = d["dark"];
+    if (d["minHz"].is<int>()) c.minHz = constrain(d["minHz"].as<int>(), 0, 120);
     if (d["fps"].is<const char *>() && strcmp(d["fps"].as<const char *>(), "auto") == 0) c.fps = TDITHER_AUTO;
     else if (d["fps"].is<int>()) { int f = d["fps"].as<int>(); c.fps = f == TDITHER_AUTO ? TDITHER_AUTO : constrain(f, 0, 250); }
     JsonArray wb = d["wb"];
@@ -117,6 +139,7 @@ class TemporalDitherUsermod : public Usermod {
     top["wbBlue"] = sWb[2];
     top["ditherDarkest"] = sDark;
     top["refreshFps"] = sFps;
+    top["flickerLimitHz"] = sMinHz;
   }
 
   bool readFromConfig(JsonObject &root) override {
@@ -129,6 +152,7 @@ class TemporalDitherUsermod : public Usermod {
     complete &= getJsonValue(top["wbBlue"], sWb[2], 255);
     complete &= getJsonValue(top["ditherDarkest"], sDark, true);
     complete &= getJsonValue(top["refreshFps"], sFps, TDITHER_AUTO);
+    complete &= getJsonValue(top["flickerLimitHz"], sMinHz, 0);
     applySaved();                        // settings page saved: use the new values now
     return complete;
   }
@@ -139,6 +163,7 @@ class TemporalDitherUsermod : public Usermod {
     oappend(F("addInfo('Temporal dither:wbRed',1,'White balance 0-255 per channel.');"));
     oappend(F("addInfo('Temporal dither:ditherDarkest',1,'Also dither below one level (smoother fades, may sparkle).');"));
     oappend(F("addInfo('Temporal dither:refreshFps',1,'Realtime (DDP etc.): re-sends per second so the dither keeps running. 255 = auto (as fast as the LEDs allow), 0 = off.');"));
+    oappend(F("addInfo('Temporal dither:flickerLimitHz',1,'No dither pattern slower than this many Hz (0 = off). Slow refresh: rounds instead of blinking.');"));
   }
 
   uint16_t getId() override { return USERMOD_ID_TEMPORAL_DITHER; }
