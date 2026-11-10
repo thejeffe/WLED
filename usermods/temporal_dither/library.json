@@ -1,0 +1,5 @@
+{
+  "name": "temporal_dither",
+  "build": { "libArchive": false },
+  "dependencies": {}
+}

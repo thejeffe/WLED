@@ -10,6 +10,7 @@
   Modified heavily for WLED
 */
 #include "wled.h"
+#include "temporal_dither.h"
 #include "FXparticleSystem.h"  // TODO: better define the required function (mem service) in FX.h?
 #include "colors.h"
 
@@ -1711,6 +1712,9 @@ void WS2812FX::show() {
   if (cctFromRgb) BusManager::setSegmentCCT(-1);
   // use color gamma correction if enabled, not in realtime mode with gamma disabled or currently overriding RT mode
   bool useGammaCorrection = gammaCorrectCol && !(realtimeMode && arlsDisableGammaCorrection && !realtimeOverride);
+  // temporal dithering (temporal_dither.h): gamma + brightness done here in 16 bit, buses at full brightness
+  const bool dither = TDither::beginFrame(totalLen, _brightness);
+  if (dither) BusManager::setBrightness(255);
 
   for (size_t i = 0; i < totalLen; i++) {
     // when correctWB is true setSegmentCCT() will convert CCT into K with which we can then
@@ -1720,7 +1724,9 @@ void WS2812FX::show() {
     }
 
     uint32_t c = _pixels[i]; // need a copy, do not modify _pixels directly (no byte access allowed on ESP32)
-    if (c > 0 && useGammaCorrection)
+    if (dither)
+      c = TDither::apply(i, c);
+    else if (c > 0 && useGammaCorrection)
       c = gamma32(c); // apply gamma correction if enabled note: applying gamma after brightness has too much color loss
     BusManager::setPixelColor(getMappedPixelIndex(i), c);
   }
@@ -1733,6 +1739,7 @@ void WS2812FX::show() {
   // all of the data has been sent.
   // See https://github.com/Makuna/NeoPixelBus/wiki/ESP32-NeoMethods#neoesp32rmt-methods
   BusManager::show();
+  if (dither) BusManager::setBrightness(scaledBri(_brightness)); // back to WLED's brightness for everything else
 
   if (diff > 0) { // skip calculation if no time has passed
     size_t fpsCurr = (1000 << FPS_CALC_SHIFT) / diff; // fixed point math
