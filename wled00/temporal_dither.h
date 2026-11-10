@@ -27,7 +27,7 @@ struct Config {
   float gamma = 2.8f;              // applied before dimming (1 = none). WLED's own gamma is skipped while on.
   uint8_t wb[3] = {255, 255, 255}; // white balance per channel (R, G, B)
   bool dark = true;                // also dither below one level (smoother fades, may sparkle when very dim)
-  uint8_t fps = 120;               // realtime mode: re-send the last frame this often (0 = only on new frames)
+  uint8_t fps = 255;               // realtime mode: re-sends per second (255 = auto: as fast as the LEDs allow, 0 = only new frames)
 };
 
 extern Config cfg;
